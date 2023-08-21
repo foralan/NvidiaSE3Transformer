@@ -30,11 +30,12 @@ from dgl.ops import edge_softmax
 from torch import Tensor
 from typing import Dict, Optional, Union
 
-from se3_transformer.model.fiber import Fiber
-from se3_transformer.model.layers.convolution import ConvSE3, ConvSE3FuseLevel
-from se3_transformer.model.layers.linear import LinearSE3
-from se3_transformer.runtime.utils import degree_to_dim, aggregate_residual, unfuse_features
-from torch.cuda.nvtx import range as nvtx_range
+from se3_transformer.fiber import Fiber
+from se3_transformer.layers.convolution import ConvSE3, ConvSE3FuseLevel
+from se3_transformer.layers.linear import LinearSE3
+from se3_transformer.utils import degree_to_dim, aggregate_residual, unfuse_features
+if torch.cuda.is_available():
+    from torch.cuda.nvtx import range as nvtx_range
 
 
 class AttentionSE3(nn.Module):
@@ -55,6 +56,9 @@ class AttentionSE3(nn.Module):
         self.num_heads = num_heads
         self.key_fiber = key_fiber
         self.value_fiber = value_fiber
+
+        if not torch.cuda.is_available():
+            self.forward = self.forward_no_nvtx
 
     def forward(
             self,
@@ -102,6 +106,48 @@ class AttentionSE3(nn.Module):
 
                 return out
 
+    def forward_no_nvtx(
+            self,
+            value: Union[Tensor, Dict[str, Tensor]],  # edge features (may be fused)
+            key: Union[Tensor, Dict[str, Tensor]],  # edge features (may be fused)
+            query: Dict[str, Tensor],  # node features
+            graph: DGLGraph
+    ):
+        if isinstance(key, Tensor):
+            # case where features of all types are fused
+            key = key.reshape(key.shape[0], self.num_heads, -1)
+            # need to reshape queries that way to keep the same layout as keys
+            out = torch.cat([query[str(d)] for d in self.key_fiber.degrees], dim=-1)
+            query = out.reshape(list(query.values())[0].shape[0], self.num_heads, -1)
+        else:
+            # features are not fused, need to fuse and reshape them
+            key = self.key_fiber.to_attention_heads(key, self.num_heads)
+            query = self.key_fiber.to_attention_heads(query, self.num_heads)
+
+        # Compute attention weights (softmax of inner product between key and query)
+        edge_weights = dgl.ops.e_dot_v(graph, key, query).squeeze(-1)
+        edge_weights = edge_weights / np.sqrt(self.key_fiber.num_features)
+        edge_weights = edge_softmax(graph, edge_weights)
+        edge_weights = edge_weights[..., None, None]
+
+        if isinstance(value, Tensor):
+            # features of all types are fused
+            v = value.view(value.shape[0], self.num_heads, -1, value.shape[-1])
+            weights = edge_weights * v
+            feat_out = dgl.ops.copy_e_sum(graph, weights)
+            feat_out = feat_out.view(feat_out.shape[0], -1, feat_out.shape[-1])  # merge heads
+            out = unfuse_features(feat_out, self.value_fiber.degrees)
+        else:
+            out = {}
+            for degree, channels in self.value_fiber:
+                v = value[str(degree)].view(-1, self.num_heads, channels // self.num_heads,
+                                            degree_to_dim(degree))
+                weights = edge_weights * v
+                res = dgl.ops.copy_e_sum(graph, weights)
+                out[str(degree)] = res.view(-1, channels, degree_to_dim(degree))  # merge heads
+
+        return out
+
 
 class AttentionBlockSE3(nn.Module):
     """ Multi-headed sparse graph self-attention block with skip connection, linear projection (SE(3)-equivariant) """
@@ -146,6 +192,9 @@ class AttentionBlockSE3(nn.Module):
         self.attention = AttentionSE3(num_heads, key_query_fiber, value_fiber)
         self.project = LinearSE3(value_fiber + fiber_in, fiber_out)
 
+        if not torch.cuda.is_available():
+            self.forward = self.forward_no_nvtx
+
     def forward(
             self,
             node_features: Dict[str, Tensor],
@@ -164,6 +213,22 @@ class AttentionBlockSE3(nn.Module):
             z = self.attention(value, key, query, graph)
             z_concat = aggregate_residual(node_features, z, 'cat')
             return self.project(z_concat)
+
+    def forward_no_nvtx(
+            self,
+            node_features: Dict[str, Tensor],
+            edge_features: Dict[str, Tensor],
+            graph: DGLGraph,
+            basis: Dict[str, Tensor]
+    ):
+        fused_key_value = self.to_key_value(node_features, edge_features, graph, basis)
+        key, value = self._get_key_value_from_fused(fused_key_value)
+
+        query = self.to_query(node_features)
+
+        z = self.attention(value, key, query, graph)
+        z_concat = aggregate_residual(node_features, z, 'cat')
+        return self.project(z_concat)
 
     def _get_key_value_from_fused(self, fused_key_value):
         # Extract keys and queries features from fused features

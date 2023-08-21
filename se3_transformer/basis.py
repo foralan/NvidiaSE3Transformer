@@ -29,9 +29,10 @@ import e3nn.o3 as o3
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-from torch.cuda.nvtx import range as nvtx_range
+if torch.cuda.is_available():
+    from torch.cuda.nvtx import range as nvtx_range
 
-from se3_transformer.runtime.utils import degree_to_dim
+from se3_transformer.utils import degree_to_dim
 
 torch._C._jit_set_profiling_executor(False)
 torch._C._jit_set_profiling_mode(False)
@@ -160,7 +161,7 @@ def update_basis_with_fused(basis: Dict[str, Tensor],
     return basis
 
 
-def get_basis(relative_pos: Tensor,
+def get_basis_nvtx(relative_pos: Tensor,
               max_degree: int = 4,
               compute_gradients: bool = False,
               use_pad_trick: bool = False,
@@ -178,3 +179,22 @@ def get_basis(relative_pos: Tensor,
                                      clebsch_gordon=clebsch_gordon,
                                      amp=amp)
             return basis
+
+def get_basis_no_nvtx(relative_pos: Tensor,
+              max_degree: int = 4,
+              compute_gradients: bool = False,
+              use_pad_trick: bool = False,
+              amp: bool = False) -> Dict[str, Tensor]:
+    spherical_harmonics = get_spherical_harmonics(relative_pos, max_degree)
+    clebsch_gordon = get_all_clebsch_gordon(max_degree, relative_pos.device)
+
+    with torch.autograd.set_grad_enabled(compute_gradients):
+        basis = get_basis_script(max_degree=max_degree,
+                                 use_pad_trick=use_pad_trick,
+                                 spherical_harmonics=spherical_harmonics,
+                                 clebsch_gordon=clebsch_gordon,
+                                 amp=amp)
+        return basis
+
+
+get_basis = get_basis_nvtx if torch.cuda.is_available() else get_basis_no_nvtx

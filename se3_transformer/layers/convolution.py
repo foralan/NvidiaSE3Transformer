@@ -32,10 +32,11 @@ import torch.nn as nn
 import torch.utils.checkpoint
 from dgl import DGLGraph
 from torch import Tensor
-from torch.cuda.nvtx import range as nvtx_range
+if torch.cuda.is_available():
+    from torch.cuda.nvtx import range as nvtx_range
 
-from se3_transformer.model.fiber import Fiber
-from se3_transformer.runtime.utils import degree_to_dim, unfuse_features
+from se3_transformer.fiber import Fiber
+from se3_transformer.utils import degree_to_dim, unfuse_features
 
 
 class ConvSE3FuseLevel(Enum):
@@ -143,6 +144,9 @@ class VersatileConvSE3(nn.Module):
                                          edge_dim=edge_dim,
                                          use_layer_norm=use_layer_norm)
 
+        if not torch.cuda.is_available():
+            self.forward = self.forward_no_nvtx
+
     def forward(self, features: Tensor, invariant_edge_feats: Tensor, basis: Tensor):
         with nvtx_range(f'VersatileConvSE3'):
             num_edges = features.shape[0]
@@ -160,6 +164,20 @@ class VersatileConvSE3(nn.Module):
                 # k = l = 0 non-fused case
                 return radial_weights @ features
 
+    def forward_no_nvtx(self, features: Tensor, invariant_edge_feats: Tensor, basis: Tensor):
+        num_edges = features.shape[0]
+        in_dim = features.shape[2]
+        radial_weights = self.radial_func(invariant_edge_feats) \
+            .view(-1, self.channels_out, self.channels_in * self.freq_sum)
+
+        if basis is not None:
+            # This block performs the einsum n i l, n o i f, n l f k -> n o k
+            basis_view = basis.view(num_edges, in_dim, -1)
+            tmp = (features @ basis_view).view(num_edges, -1, basis.shape[-1])
+            return radial_weights @ tmp
+        else:
+            # k = l = 0 non-fused case
+            return radial_weights @ features
 
 class ConvSE3(nn.Module):
     """
@@ -269,6 +287,9 @@ class ConvSE3(nn.Module):
                     self.to_kernel_self[str(degree_out)] = nn.Parameter(
                         torch.randn(channels_out, fiber_in[degree_out]) / np.sqrt(fiber_in[degree_out]))
 
+        if not torch.cuda.is_available():
+            self.forward = self.forward_no_nvtx
+
     def _try_unpad(self, feature, basis):
         # Account for padded basis
         if basis is not None:
@@ -352,3 +373,75 @@ class ConvSE3(nn.Module):
                         else:
                             out = dgl.ops.copy_e_sum(graph, out)
             return out
+
+    def forward_no_nvtx(
+            self,
+            node_feats: Dict[str, Tensor],
+            edge_feats: Dict[str, Tensor],
+            graph: DGLGraph,
+            basis: Dict[str, Tensor]
+    ):
+        invariant_edge_feats = edge_feats['0'].squeeze(-1)
+        src, dst = graph.edges()
+        out = {}
+        in_features = []
+
+        # Fetch all input features from edge and node features
+        for degree_in in self.fiber_in.degrees:
+            src_node_features = node_feats[str(degree_in)][src]
+            if degree_in > 0 and str(degree_in) in edge_feats:
+                # Handle edge features of any type by concatenating them to node features
+                src_node_features = torch.cat([src_node_features, edge_feats[str(degree_in)]], dim=1)
+            in_features.append(src_node_features)
+
+        if self.used_fuse_level == ConvSE3FuseLevel.FULL:
+            in_features_fused = torch.cat(in_features, dim=-1)
+            out = self.conv_checkpoint(
+                self.conv, in_features_fused, invariant_edge_feats, basis['fully_fused']
+            )
+
+            if not self.allow_fused_output or self.self_interaction or self.pool:
+                out = unfuse_features(out, self.fiber_out.degrees)
+
+        elif self.used_fuse_level == ConvSE3FuseLevel.PARTIAL and hasattr(self, 'conv_out'):
+            in_features_fused = torch.cat(in_features, dim=-1)
+            for degree_out in self.fiber_out.degrees:
+                basis_used = basis[f'out{degree_out}_fused']
+                out[str(degree_out)] = self._try_unpad(
+                    self.conv_checkpoint(
+                        self.conv_out[str(degree_out)], in_features_fused, invariant_edge_feats, basis_used
+                    ), basis_used)
+
+        elif self.used_fuse_level == ConvSE3FuseLevel.PARTIAL and hasattr(self, 'conv_in'):
+            out = 0
+            for degree_in, feature in zip(self.fiber_in.degrees, in_features):
+                out = out + self.conv_checkpoint(
+                    self.conv_in[str(degree_in)], feature, invariant_edge_feats, basis[f'in{degree_in}_fused']
+                )
+            if not self.allow_fused_output or self.self_interaction or self.pool:
+                out = unfuse_features(out, self.fiber_out.degrees)
+        else:
+            # Fallback to pairwise TFN convolutions
+            for degree_out in self.fiber_out.degrees:
+                out_feature = 0
+                for degree_in, feature in zip(self.fiber_in.degrees, in_features):
+                    dict_key = f'{degree_in},{degree_out}'
+                    basis_used = basis.get(dict_key, None)
+                    out_feature = out_feature + self._try_unpad(
+                        self.conv_checkpoint(
+                            self.conv[dict_key], feature, invariant_edge_feats, basis_used
+                        ), basis_used)
+                out[str(degree_out)] = out_feature
+
+        for degree_out in self.fiber_out.degrees:
+            if self.self_interaction and str(degree_out) in self.to_kernel_self:
+                dst_features = node_feats[str(degree_out)][dst]
+                kernel_self = self.to_kernel_self[str(degree_out)]
+                out[str(degree_out)] = out[str(degree_out)] + kernel_self @ dst_features
+
+            if self.pool:
+                if isinstance(out, dict):
+                    out[str(degree_out)] = dgl.ops.copy_e_sum(graph, out[str(degree_out)])
+                else:
+                    out = dgl.ops.copy_e_sum(graph, out)
+        return out

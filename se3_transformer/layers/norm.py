@@ -27,9 +27,10 @@ from typing import Dict
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch.cuda.nvtx import range as nvtx_range
+if torch.cuda.is_available():
+    from torch.cuda.nvtx import range as nvtx_range
 
-from se3_transformer.model.fiber import Fiber
+from se3_transformer.fiber import Fiber
 
 
 @torch.jit.script
@@ -67,6 +68,9 @@ class NormSE3(nn.Module):
                 for degree, channels in fiber
             })
 
+        if not torch.cuda.is_available():
+            self.forward = self.forward_no_nvtx
+
     def forward(self, features: Dict[str, Tensor], *args, **kwargs) -> Dict[str, Tensor]:
         with nvtx_range('NormSE3'):
             output = {}
@@ -90,3 +94,26 @@ class NormSE3(nn.Module):
                     output[degree] = rescale(new_norm, feat, norm)
 
             return output
+
+    def forward_no_nvtx(self, features: Dict[str, Tensor], *args, **kwargs) -> Dict[str, Tensor]:
+        output = {}
+        if hasattr(self, 'group_norm'):
+            # Compute per-degree norms of features
+            norms = [clamped_norm(features[str(d)], self.NORM_CLAMP)
+                     for d in self.fiber.degrees]
+            fused_norms = torch.cat(norms, dim=-2)
+
+            # Transform the norms only
+            new_norms = self.nonlinearity(self.group_norm(fused_norms.squeeze(-1))).unsqueeze(-1)
+            new_norms = torch.chunk(new_norms, chunks=len(self.fiber.degrees), dim=-2)
+
+            # Scale features to the new norms
+            for norm, new_norm, d in zip(norms, new_norms, self.fiber.degrees):
+                output[str(d)] = rescale(features[str(d)], norm, new_norm)
+        else:
+            for degree, feat in features.items():
+                norm = clamped_norm(feat, self.NORM_CLAMP)
+                new_norm = self.nonlinearity(self.layer_norms[degree](norm.squeeze(-1)).unsqueeze(-1))
+                output[degree] = rescale(new_norm, feat, norm)
+
+        return output

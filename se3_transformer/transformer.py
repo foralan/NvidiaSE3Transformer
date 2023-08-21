@@ -21,7 +21,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2021-2022 NVIDIA CORPORATION & AFFILIATES
 # SPDX-License-Identifier: MIT
 
-import logging
 from typing import Optional, Literal, Dict
 
 import torch
@@ -29,13 +28,13 @@ import torch.nn as nn
 from dgl import DGLGraph
 from torch import Tensor
 
-from se3_transformer.model.basis import get_basis, update_basis_with_fused
-from se3_transformer.model.layers.attention import AttentionBlockSE3
-from se3_transformer.model.layers.convolution import ConvSE3, ConvSE3FuseLevel
-from se3_transformer.model.layers.norm import NormSE3
-from se3_transformer.model.layers.pooling import GPooling
-from se3_transformer.runtime.utils import str2bool
-from se3_transformer.model.fiber import Fiber
+from se3_transformer.basis import get_basis, update_basis_with_fused
+from se3_transformer.fiber import Fiber
+from se3_transformer.layers.attention import AttentionBlockSE3
+from se3_transformer.layers.convolution import ConvSE3, ConvSE3FuseLevel
+from se3_transformer.layers.norm import NormSE3
+from se3_transformer.layers.pooling import GPooling
+from se3_transformer.utils import str2bool
 
 
 class Sequential(nn.Sequential):
